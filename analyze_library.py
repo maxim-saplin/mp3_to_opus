@@ -4,14 +4,24 @@ import argparse
 import json
 import math
 import os
+import re
 import subprocess
 import sys
+import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
 from tqdm import tqdm
+
+# Optional imports for deep ID3 recovery
+try:
+    import mutagen
+    from mutagen.id3 import ID3, ID3NoHeaderError
+    HAS_MUTAGEN = True
+except ImportError:
+    HAS_MUTAGEN = False
 
 
 SUPPORTED_AUDIO_EXTS = {
@@ -28,6 +38,26 @@ SUPPORTED_AUDIO_EXTS = {
     ".dsf",
 }
 
+# Common text tag keys we analyze for broken encoding / top values
+COMMON_TEXT_TAGS = {
+    "title",
+    "artist",
+    "album",
+    "album_artist",
+    "albumartist",
+    "genre",
+    "date",
+    "track",
+    "disc",
+    "composer",
+    "comment",
+}
+# Also include lyrics-* variants (lyrics-eng, lyrics-rus, etc.)
+LYRICS_PREFIX = "lyrics"
+
+# Fields for which we print top-20 values
+TOP_VALUE_FIELDS = ("title", "artist", "album", "genre")
+
 
 @dataclass
 class ExtStats:
@@ -42,6 +72,176 @@ class ProbeResult:
     bitrate_bps: float | None
     tag_keys: frozenset[str]
     embedded_image_count: int
+    # tag_values: {normalized_key: raw_value} for common text tags
+    tag_values: dict[str, str] = field(default_factory=dict)
+    # recovered_values: {normalized_key: recovered_value} from deep ID3 inspection
+    recovered_values: dict[str, str] = field(default_factory=dict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mojibake / broken encoding detection + recovery
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Cyrillic Unicode block ranges (basic + extended)
+_CYRILLIC_RANGES = [
+    (0x0400, 0x04FF),  # Cyrillic
+    (0x0500, 0x052F),  # Cyrillic Supplement
+]
+
+
+def _is_cyrillic(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _CYRILLIC_RANGES)
+
+
+def _cyrillic_ratio(text: str) -> float:
+    """Fraction of alphabetic characters that are Cyrillic."""
+    alpha = [c for c in text if c.isalpha()]
+    if not alpha:
+        return 0.0
+    cyr = sum(1 for c in alpha if _is_cyrillic(c))
+    return cyr / len(alpha)
+
+
+# Common mojibake patterns when UTF-8 bytes are misread as Latin-1/CP1252
+_MOJIBAKE_PATTERNS = re.compile(
+    r"["
+    r"\u00C3\u0192"  # Ã or ƒ often from UTF-8 as Latin-1
+    r"\u00C2"        # Â
+    r"\u0402-\u040F"  # Cyrillic chars often from CP1251 misread
+    r"\u2019\u201C\u201D"  # curly quotes from CP1252
+    r"]"
+    r"|"
+    r"Ð[^a-zA-Z]"  # Ð followed by weird char (UTF-8 Cyrillic prefix)
+    r"|"
+    r"Ñ[^a-zA-Z]"
+)
+
+# Replacement char or lots of control chars
+_REPLACEMENT_CHAR = "\uFFFD"
+
+
+def _looks_broken(text: str) -> bool:
+    """
+    Heuristic: returns True if text looks like mojibake / bad encoding.
+    """
+    if not text:
+        return False
+    # Explicit replacement char
+    if _REPLACEMENT_CHAR in text:
+        return True
+    # Common mojibake byte sequences
+    if _MOJIBAKE_PATTERNS.search(text):
+        return True
+    # High ratio of control chars (excluding normal whitespace)
+    ctrl = sum(1 for c in text if unicodedata.category(c) == "Cc" and c not in "\t\n\r")
+    if ctrl > len(text) * 0.1:
+        return True
+    return False
+
+
+def _try_recover(text: str) -> tuple[str | None, str | None]:
+    """
+    Attempt to recover a broken string.
+    Returns (recovered_text, method_name) or (None, None) if no fix found.
+
+    Strategies:
+    1. UTF-8 bytes misread as Latin-1  -> re-encode latin1, decode utf-8
+    2. CP1251 bytes misread as Latin-1 -> re-encode latin1, decode cp1251
+    """
+    if not text or text.strip() == "":
+        return None, None
+
+    candidates: list[tuple[str, str]] = []
+
+    # Strategy 1: Latin-1 -> UTF-8
+    try:
+        raw = text.encode("latin-1", errors="strict")
+        decoded = raw.decode("utf-8", errors="strict")
+        if decoded != text and not _looks_broken(decoded):
+            candidates.append((decoded, "latin1→utf8"))
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+
+    # Strategy 2: Latin-1 -> CP1251 (common for Russian)
+    try:
+        raw = text.encode("latin-1", errors="strict")
+        decoded = raw.decode("cp1251", errors="strict")
+        if decoded != text and not _looks_broken(decoded):
+            candidates.append((decoded, "latin1→cp1251"))
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+
+    # Strategy 3: CP1252 -> UTF-8 (Windows Western -> UTF-8)
+    try:
+        raw = text.encode("cp1252", errors="strict")
+        decoded = raw.decode("utf-8", errors="strict")
+        if decoded != text and not _looks_broken(decoded):
+            candidates.append((decoded, "cp1252→utf8"))
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+
+    if not candidates:
+        return None, None
+
+    # Prefer candidate with highest Cyrillic ratio (if any), else first
+    best = max(candidates, key=lambda c: _cyrillic_ratio(c[0]))
+    return best
+
+
+def _recover_id3_cp1251(path: Path) -> dict[str, str]:
+    """
+    Uses mutagen to inspect ID3v1/v2 tags directly.
+    Tries to interpret Latin-1 frames as CP1251 if they contain high bytes.
+    Returns a dict of {normalized_key: recovered_value} for common fields.
+    """
+    if not HAS_MUTAGEN:
+        return {}
+    
+    recovered = {}
+    try:
+        tags = ID3(path)
+    except (ID3NoHeaderError, Exception):
+        return {}
+
+    # Map common ID3 frames to our normalized keys
+    frame_map = {
+        "TIT2": "title",
+        "TPE1": "artist",
+        "TALB": "album",
+        "TCON": "genre",
+        "COMM": "comment",
+        # Add others if needed
+    }
+
+    for frame_id, key in frame_map.items():
+        frames = tags.getall(frame_id)
+        for frame in frames:
+            # We are looking for frames where encoding=0 (Latin-1) but bytes are likely CP1251
+            if getattr(frame, "encoding", -1) == 0:  # 0 is Latin-1 in ID3v2
+                # mutagen automatically decodes Latin-1 to unicode string
+                # So we take that string, re-encode to latin-1 to get bytes, then try cp1251
+                val_list = getattr(frame, "text", [])
+                if not val_list:
+                    continue
+                
+                # Handling COMM frames which are a bit different
+                if frame_id == "COMM":
+                    text_str = frame.text[0] if frame.text else ""
+                else:
+                    text_str = val_list[0]
+
+                if not text_str:
+                    continue
+
+                # Check if it looks like garbage or has replacement chars
+                if _looks_broken(text_str) or _REPLACEMENT_CHAR in text_str:
+                     # Try to recover by re-interpreting bytes
+                    rec, method = _try_recover(text_str)
+                    if rec:
+                        recovered[key] = rec
+    return recovered
+
 
 
 def _run_ffprobe_json(path: Path) -> dict[str, Any] | None:
@@ -85,23 +285,45 @@ def _get_format_number(info: dict[str, Any] | None, key: str) -> float | None:
         return None
 
 
-def _extract_tag_keys(info: dict[str, Any] | None) -> frozenset[str]:
+def _is_common_text_tag(key: str) -> bool:
+    """Check if key is a common text tag we want to analyze."""
+    kl = key.lower()
+    if kl in COMMON_TEXT_TAGS:
+        return True
+    if kl.startswith(LYRICS_PREFIX):
+        return True
+    return False
+
+
+def _extract_tag_keys_and_values(info: dict[str, Any] | None) -> tuple[frozenset[str], dict[str, str]]:
     """
-    Returns a normalized (lowercased) set of metadata tag keys present in the file.
+    Returns:
+      - A normalized (lowercased) set of metadata tag keys present in the file.
+      - A dict of {normalized_key: raw_value} for common text tags only.
     Includes both container-level format tags and stream-level tags (if present).
     """
     if not info:
-        return frozenset()
+        return frozenset(), {}
 
     keys: set[str] = set()
+    values: dict[str, str] = {}
+
+    def process_tags(tags: dict[str, Any]) -> None:
+        for k, v in tags.items():
+            ks = str(k).strip().lower()
+            if not ks:
+                continue
+            keys.add(ks)
+            # Collect value for common text tags (first occurrence wins)
+            if _is_common_text_tag(ks) and ks not in values:
+                vs = str(v).strip() if v is not None else ""
+                if vs:
+                    values[ks] = vs
 
     fmt = info.get("format") or {}
     fmt_tags = fmt.get("tags") or {}
     if isinstance(fmt_tags, dict):
-        for k in fmt_tags.keys():
-            ks = str(k).strip().lower()
-            if ks:
-                keys.add(ks)
+        process_tags(fmt_tags)
 
     streams = info.get("streams") or []
     if isinstance(streams, list):
@@ -110,12 +332,9 @@ def _extract_tag_keys(info: dict[str, Any] | None) -> frozenset[str]:
                 continue
             st_tags = st.get("tags") or {}
             if isinstance(st_tags, dict):
-                for k in st_tags.keys():
-                    ks = str(k).strip().lower()
-                    if ks:
-                        keys.add(ks)
+                process_tags(st_tags)
 
-    return frozenset(keys)
+    return frozenset(keys), values
 
 
 def _count_embedded_images(info: dict[str, Any] | None) -> int:
@@ -231,6 +450,13 @@ def main() -> int:
     total_embedded_images = 0
     files_with_any_images = 0
 
+    # Top value counters for title, artist, album, genre
+    top_values: dict[str, Counter[str]] = {f: Counter() for f in TOP_VALUE_FIELDS}
+
+    # Broken encoding tracking
+    # broken_by_field[field] = list of (path, raw_value, recovered_value_or_None, method_or_None)
+    broken_by_field: dict[str, list[tuple[Path, str, str | None, str | None]]] = defaultdict(list)
+
     for p in audio_files:
         try:
             total_audio_bytes += p.stat().st_size
@@ -254,11 +480,22 @@ def main() -> int:
                     bitrate_bps=None,
                     tag_keys=frozenset(),
                     embedded_image_count=0,
+                    tag_values={},
+                    recovered_values={},
                 )
 
             dur = _get_format_number(info, "duration")
             br = _get_format_number(info, "bit_rate")
-            tag_keys = _extract_tag_keys(info)
+            tag_keys, tag_values = _extract_tag_keys_and_values(info)
+
+            recovered_deep = {}
+            # If MP3 and we have mutagen, try to recover broken tags directly from ID3
+            if HAS_MUTAGEN and path.suffix.lower() == ".mp3":
+                # Check if we have any broken tags worth recovering
+                needs_recovery = any(_looks_broken(v) for v in tag_values.values())
+                if needs_recovery:
+                    recovered_deep = _recover_id3_cp1251(path)
+
             embedded_image_count = _count_embedded_images(info)
             return ProbeResult(
                 ffprobe_ok=True,
@@ -266,6 +503,8 @@ def main() -> int:
                 bitrate_bps=br,
                 tag_keys=tag_keys,
                 embedded_image_count=embedded_image_count,
+                tag_values=tag_values,
+                recovered_values=recovered_deep,
             )
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -281,6 +520,38 @@ def main() -> int:
                 # Tag keys (count once per file per key)
                 for k in res.tag_keys:
                     tag_key_counts[k] += 1
+
+                # Top values for title, artist, album, genre
+                # Prefer recovered values for stats if available
+                for fld in TOP_VALUE_FIELDS:
+                    val = res.tag_values.get(fld)
+                    if not val:
+                        continue
+
+                    # 1. Try deep recovery (ID3 byte inspection)
+                    rec = res.recovered_values.get(fld)
+                    
+                    # 2. If no deep recovery, try heuristic recovery (for mojibake)
+                    if not rec and _looks_broken(val):
+                        rec_heuristic, _ = _try_recover(val)
+                        if rec_heuristic:
+                            rec = rec_heuristic
+
+                    # Use recovered if available, else original
+                    final_val = rec if rec else val
+                    top_values[fld][final_val] += 1
+
+                # Broken encoding detection for common text tags
+                for fld, val in res.tag_values.items():
+                    if _looks_broken(val):
+                        # 1. Try deep recovery (mutagen ID3 inspection)
+                        deep_rec = res.recovered_values.get(fld)
+                        if deep_rec:
+                             broken_by_field[fld].append((p, val, deep_rec, "ID3-CP1251"))
+                        else:
+                             # 2. Try heuristic recovery
+                             recovered, method = _try_recover(val)
+                             broken_by_field[fld].append((p, val, recovered, method))
 
                 # Embedded images (cover art) per extension
                 ext = p.suffix.lower() or "<noext>"
@@ -320,6 +591,62 @@ def main() -> int:
     else:
         print("\n--- TAG KEYS (files containing key) ---")
         print("(none found)")
+
+    # Broken encoding summary
+    total_broken = sum(len(v) for v in broken_by_field.values())
+    total_recoverable = sum(
+        sum(1 for _, _, rec, _ in v if rec is not None)
+        for v in broken_by_field.values()
+    )
+    print("\n--- BROKEN ENCODING ANALYSIS ---")
+    print(f"Total files with broken text tags: {total_broken}")
+    print(f"Total likely recoverable: {total_recoverable}")
+    if broken_by_field:
+        print(f"\n{'Field':<20} {'Broken':>8} {'Recoverable':>12}")
+        print("-" * 42)
+        for fld in sorted(broken_by_field.keys(), key=lambda f: -len(broken_by_field[f])):
+            items = broken_by_field[fld]
+            rec_count = sum(1 for _, _, r, _ in items if r is not None)
+            print(f"{fld:<20} {len(items):>8} {rec_count:>12}")
+
+        # Sample broken values (top 20 overall, grouped by field)
+        print("\n--- SAMPLE BROKEN VALUES (up to 20) ---")
+        samples_shown = 0
+        for fld in sorted(broken_by_field.keys(), key=lambda f: -len(broken_by_field[f])):
+            if samples_shown >= 20:
+                break
+            items = broken_by_field[fld]
+            for path, raw, recovered, method in items[:max(1, 20 - samples_shown)]:
+                samples_shown += 1
+                rel_path = path.name  # just filename for brevity
+                raw_short = raw if len(raw) <= 40 else raw[:37] + "..."
+                if recovered:
+                    rec_short = recovered if len(recovered) <= 40 else recovered[:37] + "..."
+                    print(f"  [{fld}] {rel_path}")
+                    print(f"    Raw:       {raw_short}")
+                    print(f"    Recovered: {rec_short} ({method})")
+                else:
+                    print(f"  [{fld}] {rel_path}")
+                    print(f"    Raw:       {raw_short}")
+                    print(f"    Recovered: (no fix found)")
+                if samples_shown >= 20:
+                    break
+    else:
+        print("(no broken encoding detected)")
+
+    # Top 20 values for title, artist, album, genre
+    for fld in TOP_VALUE_FIELDS:
+        counter = top_values[fld]
+        print(f"\n--- TOP 20 VALUES: {fld.upper()} ---")
+        if counter:
+            print(f"{'Value':<50} {'Count':>8}")
+            print("-" * 60)
+            for val, cnt in counter.most_common(20):
+                # Truncate long values for display
+                display_val = val if len(val) <= 48 else val[:45] + "..."
+                print(f"{display_val:<50} {cnt:>8}")
+        else:
+            print("(none found)")
 
     print("\n--- EMBEDDED IMAGES (attached_pic streams) ---")
     if ffprobe_ok_files:

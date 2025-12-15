@@ -11,7 +11,7 @@ This repo contains two Python scripts to **analyze** and **convert** a music lib
 
 ### `analyze_library.py`
 - Scans your library and prints:\n  - **All file extensions** (count + total size)\n  - **MP3 bitrate buckets** (how many 320 kbps / 192 kbps / etc.)\n  - **Estimated total size** if all audio were encoded at 128 kbps
-- Also reports:\n  - **Tag key coverage** (which metadata tag names/keys exist and how many files contain each)\n  - **Embedded images** (counts `ffprobe` `attached_pic` streams) with a **per-extension breakdown**
+- Also reports:\n  - **Tag key coverage** (which metadata tag names/keys exist and how many files contain each)\n  - **Embedded images** (counts `ffprobe` `attached_pic` streams) with a **per-extension breakdown**\n  - **Top 20 values** for `title`, `artist`, `album`, and `genre`\n  - **Broken encoding analysis**: detects mojibake/garbled text in common tag fields and estimates if each is recoverable (e.g., UTF-8 bytes misread as Latin-1, CP1251 Russian text). Uses `mutagen` to inspect raw ID3 frames for deep recovery of unreadable tags.
 
 ### `convert_to_opus.py`
 - Converts supported audio formats to `.opus` under a destination folder, mirroring structure.\n- Runs multiple conversions in parallel (default: **CPU count - 1**).\n- **Safety**: destination must be **empty or not exist** (script exits if not empty).\n- Warns on unknown non-audio files (sidecars like `.jpg`, `.m3u`, `.cue` are ignored quietly).

@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import base64
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +15,7 @@ from typing import Iterable, Optional, Tuple
 
 from mutagen import File as MutagenFile
 from mutagen.flac import Picture
-from mutagen.id3 import APIC, ID3
+from mutagen.id3 import APIC, ID3, ID3NoHeaderError
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.oggopus import OggOpus
 from tqdm import tqdm
@@ -48,6 +50,203 @@ IGNORED_SIDE_EXTS = {
     ".ini",
     ".db",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Text Recovery Utils (adapted from analyze_library.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CYRILLIC_RANGES = [(0x0400, 0x04FF), (0x0500, 0x052F)]
+_MOJIBAKE_PATTERNS = re.compile(
+    r"[\u00C3\u0192\u00C2\u0402-\u040F\u2019\u201C\u201D]|Ð[^a-zA-Z]|Ñ[^a-zA-Z]"
+)
+_REPLACEMENT_CHAR = "\uFFFD"
+
+
+def _is_cyrillic(ch: str) -> bool:
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _CYRILLIC_RANGES)
+
+
+def _cyrillic_ratio(text: str) -> float:
+    alpha = [c for c in text if c.isalpha()]
+    if not alpha:
+        return 0.0
+    cyr = sum(1 for c in alpha if _is_cyrillic(c))
+    return cyr / len(alpha)
+
+
+def _looks_broken(text: str) -> bool:
+    if not text:
+        return False
+    if _REPLACEMENT_CHAR in text:
+        return True
+    if _MOJIBAKE_PATTERNS.search(text):
+        return True
+    ctrl = sum(1 for c in text if unicodedata.category(c) == "Cc" and c not in "\t\n\r")
+    if ctrl > len(text) * 0.1:
+        return True
+    return False
+
+
+def _try_recover(text: str) -> str | None:
+    """Returns recovered text or None."""
+    if not text or text.strip() == "":
+        return None
+    
+    candidates = []
+    # 1. Latin-1 -> UTF-8
+    try:
+        dec = text.encode("latin-1").decode("utf-8")
+        if dec != text and not _looks_broken(dec):
+            candidates.append(dec)
+    except Exception:
+        pass
+    # 2. Latin-1 -> CP1251
+    try:
+        dec = text.encode("latin-1").decode("cp1251")
+        if dec != text and not _looks_broken(dec):
+            candidates.append(dec)
+    except Exception:
+        pass
+    # 3. CP1252 -> UTF-8
+    try:
+        dec = text.encode("cp1252").decode("utf-8")
+        if dec != text and not _looks_broken(dec):
+            candidates.append(dec)
+    except Exception:
+        pass
+
+    if not candidates:
+        return None
+    return max(candidates, key=_cyrillic_ratio)
+
+
+def _recover_id3_cp1251(path: Path) -> dict[str, str]:
+    """Inspect ID3 tags for Latin-1 encoded CP1251 text."""
+    try:
+        tags = ID3(path)
+    except (ID3NoHeaderError, Exception):
+        return {}
+
+    recovered = {}
+    # Map ID3 frames to ffmpeg metadata keys
+    frame_map = {
+        "TIT2": "title",
+        "TPE1": "artist",
+        "TALB": "album",
+        "TCON": "genre",
+    }
+
+    for frame_id, key in frame_map.items():
+        frames = tags.getall(frame_id)
+        for frame in frames:
+            if getattr(frame, "encoding", -1) == 0:  # Latin-1
+                text_list = getattr(frame, "text", [])
+                text = text_list[0] if text_list else ""
+                if text and (_looks_broken(text) or _REPLACEMENT_CHAR in text):
+                    rec = _try_recover(text)
+                    if rec:
+                        recovered[key] = rec
+    return recovered
+
+
+def get_smart_metadata(src: Path) -> Tuple[dict[str, str], bool, bool]:
+    """
+    Returns (meta_overrides, recovered_flag, filled_flag).
+    """
+    meta = {}
+    recovered = False
+    filled = False
+    
+    # Read raw tags first
+    try:
+        f = MutagenFile(src)
+        if f:
+            pass
+    except Exception:
+        pass
+
+    # For MP3s, we might have deeply recovered tags
+    if src.suffix.lower() == ".mp3":
+        recovered_id3 = _recover_id3_cp1251(src)
+        if recovered_id3:
+            meta.update(recovered_id3)
+            recovered = True
+
+    # We need "current" title/artist to decide if we should overwrite with filename
+    # Simple extraction:
+    cur_title = meta.get("title")
+    cur_artist = meta.get("artist")
+    
+    # If not recovered yet, try reading standard tags
+    if not cur_title or not cur_artist:
+        try:
+            f = MutagenFile(src)
+            if f and f.tags:
+                # easy access helper
+                def get_tag(k_list):
+                    for k in k_list:
+                        if k in f.tags:
+                            val = f.tags[k]
+                            if isinstance(val, list) and val:
+                                v = val[0]
+                                if hasattr(v, "text"):
+                                    return v.text[0]
+                                return str(v)
+                    return None
+
+                if not cur_title:
+                    t = get_tag(["title", "TITLE", "TIT2", "©nam"])
+                    if t: cur_title = t
+                if not cur_artist:
+                    a = get_tag(["artist", "ARTIST", "TPE1", "©ART"])
+                    if a: cur_artist = a
+        except Exception:
+            pass
+
+    # Heuristic fix for current tags if they exist but are broken
+    if cur_title and _looks_broken(cur_title):
+        rec = _try_recover(cur_title)
+        if rec:
+            cur_title = rec
+            recovered = True
+    if cur_artist and _looks_broken(cur_artist):
+        rec = _try_recover(cur_artist)
+        if rec:
+            cur_artist = rec
+            recovered = True
+
+    # Check for missing/generic
+    # Generic patterns: "Track 1", "no title", empty
+    generic_re = re.compile(r"^(track\s*\d+|no\s*title|unknown|artist|title)$", re.IGNORECASE)
+
+    is_title_bad = not cur_title or not cur_title.strip() or generic_re.match(cur_title.strip())
+    is_artist_bad = not cur_artist or not cur_artist.strip() or generic_re.match(cur_artist.strip())
+
+    # If bad, try filename parse: "Artist - Title.ext"
+    if is_title_bad or is_artist_bad:
+        # e.g. "Dj Smash - Между небом и землей.mp3"
+        stem = src.stem  # "Dj Smash - Между небом и землей"
+        # Match "Artist - Title"
+        # We assume " - " separator.
+        parts = stem.split(" - ", 1)
+        if len(parts) == 2:
+            fname_artist, fname_title = parts[0].strip(), parts[1].strip()
+            if is_artist_bad and fname_artist:
+                cur_artist = fname_artist
+                filled = True
+            if is_title_bad and fname_title:
+                cur_title = fname_title
+                filled = True
+    
+    # Update meta dict with final values if they differ from what might be in the file
+    if cur_title:
+        meta["title"] = cur_title
+    if cur_artist:
+        meta["artist"] = cur_artist
+
+    return meta, recovered, filled
 
 
 def human_bytes(num_bytes: int) -> str:
@@ -92,7 +291,7 @@ def classify_non_audio(p: Path) -> str:
     return "warn"
 
 
-def run_ffmpeg_convert(src: Path, dst: Path, bitrate: str) -> Tuple[bool, str]:
+def run_ffmpeg_convert(src: Path, dst: Path, bitrate: str, metadata: dict[str, str] | None = None) -> Tuple[bool, str]:
     """
     Returns (ok, message). If failed, message contains stderr (best-effort).
     """
@@ -119,9 +318,18 @@ def run_ffmpeg_convert(src: Path, dst: Path, bitrate: str) -> Tuple[bool, str]:
         "audio",
         "-map_metadata",
         "0",
+    ]
+
+    # Add metadata overrides
+    if metadata:
+        for k, v in metadata.items():
+            if v:
+                cmd.extend(["-metadata", f"{k}={v}"])
+
+    cmd.extend([
         "-vn",
         str(dst),
-    ]
+    ])
 
     try:
         proc = subprocess.run(cmd, capture_output=True, check=False)
@@ -259,12 +467,17 @@ class JobResult:
     cover_found: bool = False
     cover_embedded: bool = False
     cover_error: str = ""
+    tags_recovered: bool = False
+    tags_filled: bool = False
 
 
 def process_job(job: Job, bitrate: str) -> JobResult:
     job.dst.parent.mkdir(parents=True, exist_ok=True)
 
-    ok, err = run_ffmpeg_convert(job.src, job.dst, bitrate)
+    # Determine smart metadata (fix broken tags, fill from filename)
+    meta, recovered, filled = get_smart_metadata(job.src)
+
+    ok, err = run_ffmpeg_convert(job.src, job.dst, bitrate, metadata=meta)
     if not ok:
         return JobResult(src=job.src, dst=job.dst, ok=False, error=err)
 
@@ -274,7 +487,15 @@ def process_job(job: Job, bitrate: str) -> JobResult:
         mime, data = cover
         try:
             embed_cover_into_opus(job.dst, mime, data)
-            return JobResult(src=job.src, dst=job.dst, ok=True, cover_found=True, cover_embedded=True)
+            return JobResult(
+                src=job.src,
+                dst=job.dst,
+                ok=True,
+                cover_found=True,
+                cover_embedded=True,
+                tags_recovered=recovered,
+                tags_filled=filled,
+            )
         except Exception:
             # Don't fail the whole conversion if cover embedding fails.
             return JobResult(
@@ -284,9 +505,19 @@ def process_job(job: Job, bitrate: str) -> JobResult:
                 cover_found=True,
                 cover_embedded=False,
                 cover_error="embed_failed",
+                tags_recovered=recovered,
+                tags_filled=filled,
             )
 
-    return JobResult(src=job.src, dst=job.dst, ok=True, cover_found=False, cover_embedded=False)
+    return JobResult(
+        src=job.src,
+        dst=job.dst,
+        ok=True,
+        cover_found=False,
+        cover_embedded=False,
+        tags_recovered=recovered,
+        tags_filled=filled,
+    )
 
 
 def main() -> int:
@@ -357,21 +588,23 @@ def main() -> int:
         out_rel = rel.with_suffix(".opus")
         out_path = dst / out_rel
         if out_path in out_map:
+            # Collision detected: record it but don't add job (first wins)
             collisions.setdefault(out_path, [out_map[out_path]]).append(p)
         else:
             out_map[out_path] = p
             jobs.append(Job(src=p, dst=out_path))
 
     if collisions:
-        print("\nERROR: Output name collisions detected (same output .opus path from multiple inputs).", file=sys.stderr)
+        print("\nWARNING: Output name collisions detected. Using first file, skipping others.", file=sys.stderr)
         for out_path, inputs in list(collisions.items())[:20]:
-            print(f"  {out_path} <-", file=sys.stderr)
-            for inp in inputs:
-                print(f"    - {inp}", file=sys.stderr)
+            winner = inputs[0]
+            losers = inputs[1:]
+            print(f"  {out_path}", file=sys.stderr)
+            print(f"    + Using: {winner}", file=sys.stderr)
+            for l in losers:
+                print(f"    - Skip:  {l}", file=sys.stderr)
         if len(collisions) > 20:
             print(f"  ... and {len(collisions) - 20} more collisions", file=sys.stderr)
-        print("Fix by renaming duplicates in source (e.g., same song name in same folder with different extensions).", file=sys.stderr)
-        return 2
 
     # Convert in parallel
     errors: list[JobResult] = []
@@ -380,6 +613,8 @@ def main() -> int:
     cover_missing_count = 0
     cover_embedded_count = 0
     cover_embed_failed_count = 0
+    tags_recovered_count = 0
+    tags_filled_count = 0
 
     print("\nConverting...")
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -396,6 +631,11 @@ def main() -> int:
                         cover_embed_failed_count += 1
                 else:
                     cover_missing_count += 1
+                
+                if res.tags_recovered:
+                    tags_recovered_count += 1
+                if res.tags_filled:
+                    tags_filled_count += 1
             else:
                 errors.append(res)
 
@@ -415,6 +655,10 @@ def main() -> int:
     print(f"Cover embedded: {cover_embedded_count}/{len(jobs)} (best-effort)")
     if cover_embed_failed_count:
         print(f"Cover embed failed: {cover_embed_failed_count}/{len(jobs)} (best-effort)")
+    
+    print(f"Tags recovered: {tags_recovered_count}/{len(jobs)} (encoding fix)")
+    print(f"Tags filled: {tags_filled_count}/{len(jobs)} (from filename)")
+
     if errors:
         print(f"Errors: {len(errors)}")
         print("First errors:")
