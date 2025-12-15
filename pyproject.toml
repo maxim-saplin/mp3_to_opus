@@ -1,0 +1,9 @@
+[project]
+name = "opus-mp3"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "mutagen>=1.47.0",
+    "tqdm>=4.67.1",
+]
