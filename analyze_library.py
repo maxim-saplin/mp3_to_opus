@@ -35,6 +35,15 @@ class ExtStats:
     size_bytes: int = 0
 
 
+@dataclass(frozen=True)
+class ProbeResult:
+    ffprobe_ok: bool
+    duration_sec: float | None
+    bitrate_bps: float | None
+    tag_keys: frozenset[str]
+    embedded_image_count: int
+
+
 def _run_ffprobe_json(path: Path) -> dict[str, Any] | None:
     """
     Returns ffprobe JSON dict, or None if ffprobe fails.
@@ -45,9 +54,8 @@ def _run_ffprobe_json(path: Path) -> dict[str, Any] | None:
         "error",
         "-print_format",
         "json",
-        "-show_entries",
-        "format=duration,bit_rate",
         "-show_format",
+        "-show_streams",
         str(path),
     ]
     try:
@@ -75,6 +83,64 @@ def _get_format_number(info: dict[str, Any] | None, key: str) -> float | None:
         return float(val)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_tag_keys(info: dict[str, Any] | None) -> frozenset[str]:
+    """
+    Returns a normalized (lowercased) set of metadata tag keys present in the file.
+    Includes both container-level format tags and stream-level tags (if present).
+    """
+    if not info:
+        return frozenset()
+
+    keys: set[str] = set()
+
+    fmt = info.get("format") or {}
+    fmt_tags = fmt.get("tags") or {}
+    if isinstance(fmt_tags, dict):
+        for k in fmt_tags.keys():
+            ks = str(k).strip().lower()
+            if ks:
+                keys.add(ks)
+
+    streams = info.get("streams") or []
+    if isinstance(streams, list):
+        for st in streams:
+            if not isinstance(st, dict):
+                continue
+            st_tags = st.get("tags") or {}
+            if isinstance(st_tags, dict):
+                for k in st_tags.keys():
+                    ks = str(k).strip().lower()
+                    if ks:
+                        keys.add(ks)
+
+    return frozenset(keys)
+
+
+def _count_embedded_images(info: dict[str, Any] | None) -> int:
+    """
+    Counts embedded image streams using ffprobe's `streams[].disposition.attached_pic`.
+    This typically detects cover art for MP3/M4A/FLAC, etc., when represented as an attached picture stream.
+    """
+    if not info:
+        return 0
+
+    streams = info.get("streams") or []
+    if not isinstance(streams, list):
+        return 0
+
+    n = 0
+    for st in streams:
+        if not isinstance(st, dict):
+            continue
+        disp = st.get("disposition") or {}
+        if not isinstance(disp, dict):
+            continue
+        attached = disp.get("attached_pic")
+        if attached in (1, "1", True):
+            n += 1
+    return n
 
 
 def _iter_files(root: Path) -> Iterable[Path]:
@@ -157,7 +223,13 @@ def main() -> int:
     ffprobe_failures = 0
     probed_audio_bytes = 0
     probed_audio_files = 0
+    ffprobe_ok_files = 0
     total_audio_bytes = 0
+    tag_key_counts: Counter[str] = Counter()
+    embedded_images_by_ext: Counter[str] = Counter()
+    files_with_images_by_ext: Counter[str] = Counter()
+    total_embedded_images = 0
+    files_with_any_images = 0
 
     for p in audio_files:
         try:
@@ -173,30 +245,61 @@ def main() -> int:
         # so Python threads work well while waiting on subprocesses.
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def probe_one(path: Path) -> tuple[float | None, float | None]:
+        def probe_one(path: Path) -> ProbeResult:
             info = _run_ffprobe_json(path)
             if not info:
-                return None, None
-            return _get_format_number(info, "duration"), _get_format_number(info, "bit_rate")
+                return ProbeResult(
+                    ffprobe_ok=False,
+                    duration_sec=None,
+                    bitrate_bps=None,
+                    tag_keys=frozenset(),
+                    embedded_image_count=0,
+                )
+
+            dur = _get_format_number(info, "duration")
+            br = _get_format_number(info, "bit_rate")
+            tag_keys = _extract_tag_keys(info)
+            embedded_image_count = _count_embedded_images(info)
+            return ProbeResult(
+                ffprobe_ok=True,
+                duration_sec=dur,
+                bitrate_bps=br,
+                tag_keys=tag_keys,
+                embedded_image_count=embedded_image_count,
+            )
 
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {ex.submit(probe_one, p): p for p in audio_files}
             for fut in tqdm(as_completed(futures), total=len(futures), unit="file", dynamic_ncols=True):
                 p = futures[fut]
-                dur, br = fut.result()
-                if dur is None or dur <= 0:
+                res = fut.result()
+                if not res.ffprobe_ok:
                     ffprobe_failures += 1
                     continue
 
-                total_audio_duration_sec += dur
-                probed_audio_files += 1
-                try:
-                    probed_audio_bytes += p.stat().st_size
-                except OSError:
-                    pass
+                ffprobe_ok_files += 1
+                # Tag keys (count once per file per key)
+                for k in res.tag_keys:
+                    tag_key_counts[k] += 1
 
-                if p.suffix.lower() == ".mp3" and br is not None and br > 0:
-                    kbps = int(round(br / 1000.0))
+                # Embedded images (cover art) per extension
+                ext = p.suffix.lower() or "<noext>"
+                if res.embedded_image_count > 0:
+                    files_with_any_images += 1
+                    files_with_images_by_ext[ext] += 1
+                    embedded_images_by_ext[ext] += res.embedded_image_count
+                    total_embedded_images += res.embedded_image_count
+
+                if res.duration_sec is not None and res.duration_sec > 0:
+                    total_audio_duration_sec += res.duration_sec
+                    probed_audio_files += 1
+                    try:
+                        probed_audio_bytes += p.stat().st_size
+                    except OSError:
+                        pass
+
+                if p.suffix.lower() == ".mp3" and res.bitrate_bps is not None and res.bitrate_bps > 0:
+                    kbps = int(round(res.bitrate_bps / 1000.0))
                     mp3_bitrate_buckets[kbps] += 1
 
     if mp3_bitrate_buckets:
@@ -207,10 +310,38 @@ def main() -> int:
         print("\n--- MP3 BITRATE BUCKETS (kbps) ---")
         print("(none found)")
 
+    if tag_key_counts and ffprobe_ok_files:
+        print("\n--- TAG KEYS (files containing key) ---")
+        print(f"{'Key':<26} {'Files':>10} {'Pct':>7}")
+        print("-" * 45)
+        for k, c in sorted(tag_key_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            pct = (c / ffprobe_ok_files) * 100.0
+            print(f"{k:<26} {c:>10} {pct:>6.1f}%")
+    else:
+        print("\n--- TAG KEYS (files containing key) ---")
+        print("(none found)")
+
+    print("\n--- EMBEDDED IMAGES (attached_pic streams) ---")
+    if ffprobe_ok_files:
+        print(f"Files with embedded images: {files_with_any_images}/{ffprobe_ok_files}")
+    else:
+        print("Files with embedded images: (unavailable; no ffprobe results)")
+    print(f"Total embedded images: {total_embedded_images}")
+    if embedded_images_by_ext or files_with_images_by_ext:
+        print(f"{'Ext':<10} {'FilesWithArt':>14} {'Images':>10}")
+        print("-" * 38)
+        all_exts = set(embedded_images_by_ext.keys()) | set(files_with_images_by_ext.keys())
+        for ext in sorted(all_exts, key=lambda e: (-files_with_images_by_ext.get(e, 0), e)):
+            print(f"{ext:<10} {files_with_images_by_ext.get(ext, 0):>14} {embedded_images_by_ext.get(ext, 0):>10}")
+    else:
+        print("(none found)")
+
     hours = total_audio_duration_sec / 3600.0
     print("\n--- SUMMARY ---")
     print(f"Audio files (supported): {len(audio_files)}")
     print(f"Current audio size: { _human_bytes(total_audio_bytes) }")
+    if audio_files:
+        print(f"ffprobe OK (metadata): {ffprobe_ok_files} files")
     print(f"Probed (duration OK): {probed_audio_files} files")
     if probed_audio_files:
         print(f"Probed audio size: { _human_bytes(probed_audio_bytes) }")
